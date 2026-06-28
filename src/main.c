@@ -11,10 +11,20 @@
 #include <termios.h>
 #include <unistd.h>
 
+#define ERROR_MSG_LENGTH 128
+#define COMMAND_LINE_LENGTH 128
+
+#define MODE_DEFAULT 0
+#define MODE_CMD 1
+
 #define KEY_UP -2
 #define KEY_DOWN -3
 #define KEY_RIGHT -4
 #define KEY_LEFT -5
+#define KEY_INSERT -6
+#define KEY_ENTER '\n'
+#define KEY_BACKSPACE '\b'
+#define KEY_DELETE 0x7f
 
 #define SETDIR_SELECTED -1
 #define SETDIR_PARENT -2
@@ -27,9 +37,11 @@
 #define SET_CURSOR_HOME ESC("H")
 #define DELETE_ALL ESC("2J")
 #define DELETE_LINE ESC("2K")
-#define STYLE_RESET ESC("0m")
-#define STYLE_BOLD ESC("1m")
-#define STYLE_UNDERLINE ESC("4m")
+
+#define S_RESET ESC("0m")
+#define ST_BOLD ESC("1m")
+#define ST_UNDERLINE ESC("4m")
+#define SF_ERROR ESC("31m")
 
 typedef struct Terminal {
   struct termios old_settings;
@@ -47,14 +59,37 @@ typedef struct Directory {
 } Directory;
 static Directory g_directory = {0};
 
+typedef struct State {
+  char error_msg[ERROR_MSG_LENGTH];
+  int mode;
+  char cmd_line[COMMAND_LINE_LENGTH];
+  int cmd_line_length;
+  int cmd_line_position;
+} State;
+static State g_state = {0};
+
 void get_terminal_size(int _) {
   struct winsize w;
   if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) != 0) {
-    exit(EXIT_FAILURE);
+    strcpy(g_state.error_msg, "Can't get terminal size");
+    return;
   }
 
   g_terminal.lines = w.ws_row;
   g_terminal.columns = w.ws_col;
+}
+
+void set_cursor_line(int line) {
+  int l = line;
+  if (line < 0) {
+    l = g_terminal.lines + line + 1;
+  }
+
+  printf("\x1b[%d;0H", l);
+}
+
+void set_cursor_column(int cols) {
+  printf("\x1b[%dG", cols);
 }
 
 void reset_terminal(void) {
@@ -71,7 +106,7 @@ void init_terminal(void) {
   struct termios new_settings = g_terminal.old_settings;
   new_settings.c_lflag &= ~(ICANON | ECHO);
 
-  // setup terminal
+  // setup terminal:
   printf(ENABLE_ALT_BUFFER DELETE_ALL SET_CURSOR_INVISIBLE SET_CURSOR_HOME);
   fflush(stdout);
   tcsetattr(STDIN_FILENO, TCSANOW, &new_settings);
@@ -83,7 +118,7 @@ void init_terminal(void) {
   sa.sa_flags = 0;
   sa.sa_handler = get_terminal_size;
   if (sigaction(SIGWINCH, &sa, NULL) != 0) {
-    exit(EXIT_FAILURE);
+    strcpy(g_state.error_msg, "Can't setup signal action: SIGWINCH");
   }
 
   atexit(reset_terminal);
@@ -107,7 +142,8 @@ void get_directory(void) {
 
   // get cwd
   if(getcwd(g_directory.path, sizeof(g_directory.path)) == NULL) {
-    exit(EXIT_FAILURE);
+    strcpy(g_state.error_msg, "Can't get current working directory");
+    return;
   }
 
   // get entries
@@ -118,19 +154,21 @@ void get_directory(void) {
     alphasort
   );
   if (g_directory.entries_length == -1) {
-    exit(EXIT_FAILURE);
+    strcpy(g_state.error_msg, "Can't get directory entries");
+    return;
   }
 
   // get status of each file
   g_directory.entries_stat = malloc(sizeof(struct stat) * g_directory.entries_length);
   if (g_directory.entries_stat == NULL) {
-    exit(EXIT_FAILURE);
+    strcpy(g_state.error_msg, "Failed to allocate memory for directory entry status");
+    return;
   }
 
   for (int i = 0; i < g_directory.entries_length; i++) {
     if (stat(g_directory.entries[i]->d_name, &(g_directory.entries_stat[i])) == -1) {
-      exit(EXIT_FAILURE);
-    };
+      strcpy(g_state.error_msg, "Couldn't get file status");
+    }
   }
 }
 
@@ -164,7 +202,8 @@ void set_directory(int i) {
 
   // change directory
   if (chdir(newDir) == -1) {
-    exit(EXIT_FAILURE);
+    strcpy(g_state.error_msg, "Couldn't change directory");
+    return;
   }
 
   get_directory();
@@ -193,17 +232,17 @@ void display_directory(void) {
 
     if (i == g_directory.selected_entry) {
       printf(
-        STYLE_BOLD "%s "
-        STYLE_UNDERLINE "%s >"
-        STYLE_RESET "\n",
+        ST_BOLD "%s "
+        ST_UNDERLINE "%s >"
+        S_RESET "\n",
 
         fileType,
         g_directory.entries[i]->d_name
       );
     } else {
       printf(
-        STYLE_BOLD "%s "
-        STYLE_RESET "%s\n",
+        ST_BOLD "%s "
+        S_RESET "%s\n",
 
         fileType,
         g_directory.entries[i]->d_name
@@ -212,14 +251,56 @@ void display_directory(void) {
   }
 }
 
+void display_state(void) {
+  if (g_state.error_msg[0] != '\0') {
+    set_cursor_line(-2);
+    printf(ST_BOLD SF_ERROR "ERROR: %s\n" S_RESET, g_state.error_msg);
+  }
+
+  set_cursor_line(-1);
+
+  switch (g_state.mode) {
+  case MODE_DEFAULT:
+    printf(ST_BOLD " DEFAULT ");
+    break;
+  case MODE_CMD:
+    printf(ST_BOLD "   CMD   ");
+    break;
+  }
+
+  printf("> " S_RESET "%s" ST_BOLD, g_state.cmd_line);
+
+  if (g_state.mode == MODE_CMD) {
+    // 12 is the number of columns used before the command
+    set_cursor_column(g_state.cmd_line_position + 12);
+    printf(SET_CURSOR_VISIBLE);
+  }
+}
+
+void run_cmd_line(void) {
+  system(g_state.cmd_line);
+  memset(g_state.cmd_line, 0, COMMAND_LINE_LENGTH);
+  g_state.cmd_line_position = 0;
+  get_directory();
+}
+
 int get_input(void) {
   int input = getchar();
 
   if (input == '\x1b') {
     input = getchar();
-
     if (input == '[') {
       input = getchar();
+
+      if (input == '2') {
+        input = getchar();
+
+        if (input == '~') {
+          return KEY_INSERT;
+        } else {
+          return input;
+        }
+      }
 
       switch (input) {
       case 'A':
@@ -231,10 +312,40 @@ int get_input(void) {
       case 'D':
         return KEY_LEFT;
       }
+    } else {
+      input = getchar();
     }
   }
 
   return input;
+}
+
+void process_cmd_line_input(int input) {
+  int cmdLineLength = strlen(g_state.cmd_line);
+
+  if (input == KEY_ENTER) {
+    if (cmdLineLength > 0) {
+      run_cmd_line();
+    }
+  } else if (input == KEY_LEFT) {
+    if (--g_state.cmd_line_position < 0) {
+      g_state.cmd_line_position = 0;
+    }
+  } else if (input == KEY_RIGHT) {
+    if (++g_state.cmd_line_position > cmdLineLength) {
+      g_state.cmd_line_position = cmdLineLength;
+    }
+  } else if (input == KEY_BACKSPACE || input == KEY_DELETE) {
+    if (cmdLineLength > 0) {
+      strcpy(
+        &g_state.cmd_line[g_state.cmd_line_position - 1],
+        &g_state.cmd_line[g_state.cmd_line_position--]
+      );
+    }
+  } else if (cmdLineLength < COMMAND_LINE_LENGTH - 1) {
+    strcpy(&g_state.cmd_line[g_state.cmd_line_position + 1], &g_state.cmd_line[g_state.cmd_line_position]);
+    g_state.cmd_line[g_state.cmd_line_position++] = (char) input;
+  } 
 }
 
 int main(void) {
@@ -244,14 +355,23 @@ int main(void) {
 
   bool running = true;
   while (running) {
-    printf(DELETE_ALL SET_CURSOR_HOME);
+    printf(DELETE_ALL SET_CURSOR_HOME SET_CURSOR_INVISIBLE);
     display_directory();
+    display_state();
     fflush(stdout);
 
+    // get input then reset the error message
     int input = get_input();
+    g_state.error_msg[0] = '\0';
 
-    if (input == 'q') {
+    if (input == KEY_INSERT) {
+      g_state.mode = !g_state.mode;
+    } else if (g_state.mode == MODE_CMD) {
+      process_cmd_line_input(input);
+    } else if (input == 'q' || input == 'Q') {
       running = false;
+    } else if (input == KEY_INSERT) {
+      g_state.mode = !g_state.mode;
     } else if (
       input == KEY_UP &&
       --g_directory.selected_entry < 0
